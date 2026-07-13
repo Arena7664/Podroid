@@ -21,4 +21,52 @@ jobs:
       - name: Free runner disk space
         shell: bash
         run: |
-          sudo rm -rf /usr/share
+          sudo rm -rf /usr/local/lib/android/sdk/system-images || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet || true
+          docker system prune -af || true
+          df -h
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up arm64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Restore build caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: podroid-arch-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', '**/*.gradle.kts', 'gradle.properties') }}
+          restore-keys: |
+            podroid-arch-${{ runner.os }}-
+
+      - name: Decode Arch build script
+        shell: bash
+        run: |
+          base64 -d ci/build-podroid-arch.sh.gz.b64 | gzip -d > /tmp/build-podroid-arch.sh
+          chmod +x /tmp/build-podroid-arch.sh
+          bash -n /tmp/build-podroid-arch.sh
+
+      - name: Build Arch guest and APK
+        shell: bash
+        run: /tmp/build-podroid-arch.sh "$GITHUB_WORKSPACE"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Podroid-Arch-debug
+          path: |
+            ../artifact/Podroid-Arch-1.2.6-debug.apk
+            ../artifact/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
