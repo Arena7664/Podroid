@@ -53,6 +53,7 @@ jobs:
         shell: bash
         run: |
           base64 -d ci/build-podroid-arch.sh.gz.b64 | gzip -d > /tmp/build-podroid-arch.sh
+          sed -i 's#https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz#https://mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz#' /tmp/build-podroid-arch.sh
           chmod +x /tmp/build-podroid-arch.sh
           bash -n /tmp/build-podroid-arch.sh
 
