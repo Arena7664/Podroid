@@ -58,7 +58,23 @@ jobs:
 
       - name: Build Arch guest and APK
         shell: bash
-        run: /tmp/build-podroid-arch.sh "$GITHUB_WORKSPACE"
+        run: |
+          set -o pipefail
+          /tmp/build-podroid-arch.sh "$GITHUB_WORKSPACE" 2>&1 | tee "$RUNNER_TEMP/podroid-arch-build.log"
+
+      - name: Show failure tail
+        if: failure()
+        shell: bash
+        run: tail -n 250 "$RUNNER_TEMP/podroid-arch-build.log" || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Podroid-Arch-build-log
+          path: ${{ runner.temp }}/podroid-arch-build.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
