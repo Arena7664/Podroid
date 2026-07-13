@@ -54,6 +54,7 @@ jobs:
         run: |
           base64 -d ci/build-podroid-arch.sh.gz.b64 | gzip -d > /tmp/build-podroid-arch.sh
           sed -i 's#curl -fL --retry 5 --retry-delay 4 -o archlinuxarm.tar.gz#curl -fkL --retry 5 --retry-delay 4 -o archlinuxarm.tar.gz#' /tmp/build-podroid-arch.sh
+          sed -i 's#cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"#rm -f "$ROOTFS/etc/resolv.conf"\ncp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"#' /tmp/build-podroid-arch.sh
           chmod +x /tmp/build-podroid-arch.sh
           bash -n /tmp/build-podroid-arch.sh
 
