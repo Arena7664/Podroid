@@ -1,0 +1,91 @@
+name: Build Arch APK
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Podroid Arch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          sudo rm -rf /usr/local/lib/android/sdk/system-images || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet || true
+          docker system prune -af || true
+          df -h
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up arm64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Restore build caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: podroid-arch-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', '**/*.gradle.kts', 'gradle.properties') }}
+          restore-keys: |
+            podroid-arch-${{ runner.os }}-
+
+      - name: Decode Arch build script
+        shell: bash
+        run: |
+          base64 -d ci/build-podroid-arch.sh.gz.b64 | gzip -d > /tmp/build-podroid-arch.sh
+          sed -i 's#curl -fL --retry 5 --retry-delay 4 -o archlinuxarm.tar.gz#curl -fkL --retry 5 --retry-delay 4 -o archlinuxarm.tar.gz#' /tmp/build-podroid-arch.sh
+          sed -i 's#cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"#rm -f "$ROOTFS/etc/resolv.conf"\ncp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"#' /tmp/build-podroid-arch.sh
+          sed -i 's#pacman-key --init#printf "\\nDisableSandbox\\n" >> /etc/pacman.conf\npacman-key --init#' /tmp/build-podroid-arch.sh
+          chmod +x /tmp/build-podroid-arch.sh
+          bash -n /tmp/build-podroid-arch.sh
+
+      - name: Build Arch guest and APK
+        shell: bash
+        run: |
+          set -o pipefail
+          /tmp/build-podroid-arch.sh "$GITHUB_WORKSPACE" 2>&1 | tee "$RUNNER_TEMP/podroid-arch-build.log"
+
+      - name: Show failure tail
+        if: failure()
+        shell: bash
+        run: tail -n 250 "$RUNNER_TEMP/podroid-arch-build.log" || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Podroid-Arch-build-log
+          path: ${{ runner.temp }}/podroid-arch-build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Podroid-Arch-debug
+          path: |
+            ../artifact/Podroid-Arch-1.2.6-debug.apk
+            ../artifact/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
