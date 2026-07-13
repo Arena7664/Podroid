@@ -98,6 +98,8 @@
     <string name="avf_diagnostic">AVF (pKVM) 诊断</string>
     <string name="running_avf_diagnostic">运行 AVF 诊断…</string>
     <string name="probing_avf">正在探测…</string>
+    <string name="gpu_display_probe">GPU 显示探测（实验性）</string>
+    <string name="running_gpu_probe">正在运行 GPU 显示探测…</string>
     <string name="export_diagnostic_subject">Podroid 诊断日志</string>
     <string name="export_diagnostic_chooser">分享诊断日志</string>
     <string name="export_diagnostic_failed">导出失败：%1$s</string>

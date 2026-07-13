@@ -126,6 +126,8 @@ fun SettingsScreen(
     var showLanguageDialog by remember { mutableStateOf(false) }
     var avfReportText by remember { mutableStateOf<String?>(null) }
     var avfRunning by remember { mutableStateOf(false) }
+    var gpuProbeText by remember { mutableStateOf<String?>(null) }
+    var gpuProbeRunning by remember { mutableStateOf(false) }
     val avfScope = rememberCoroutineScope()
     val ctx = LocalContext.current
     val vmNotRunning = vmState !is VmState.Running && vmState !is VmState.Starting
@@ -405,6 +407,19 @@ fun SettingsScreen(
                         }
                     },
                 )
+                Spacer(Modifier.height(PodroidTokens.Spacing.SM))
+                PodroidGhostButton(
+                    text = if (gpuProbeRunning) stringResource(R.string.running_gpu_probe) else stringResource(R.string.gpu_display_probe),
+                    onClick = {
+                        if (gpuProbeRunning) return@PodroidGhostButton
+                        gpuProbeRunning = true
+                        gpuProbeText = ctx.getString(R.string.probing_avf)
+                        avfScope.launch {
+                            gpuProbeText = withContext(Dispatchers.IO) { AvfDiagnostics.runGpuDisplaySmokeTest(ctx) }
+                            gpuProbeRunning = false
+                        }
+                    },
+                )
 
                 Spacer(Modifier.height(PodroidTokens.Spacing.XL2))
             }
@@ -455,6 +470,40 @@ fun SettingsScreen(
             },
             confirmButton = {
                 TextButton(onClick = { avfReportText = null }) { Text(stringResource(R.string.close)) }
+            },
+        )
+    }
+
+    gpuProbeText?.let { report ->
+        AlertDialog(
+            onDismissRequest = { gpuProbeText = null },
+            title = { Text(stringResource(R.string.gpu_display_probe)) },
+            text = {
+                androidx.compose.material3.Card(
+                    colors = androidx.compose.material3.CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
+                            .padding(PodroidTokens.Spacing.SM),
+                    ) {
+                        Text(
+                            text = report,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontSize = 10.sp,
+                                lineHeight = 14.sp,
+                            ),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { gpuProbeText = null }) { Text(stringResource(R.string.close)) }
             },
         )
     }

@@ -15,12 +15,27 @@
  * what's present, what's granted, whether the service is reachable, and
  * (optionally) attempts to create + start a minimal VM using our existing
  * Alpine kernel/initrd in filesDir.
+ *
+ * Also hosts runGpuDisplaySmokeTest(): a separate, experimental spike that
+ * checks whether a non-platform-signed app can reach a real GPU-accelerated
+ * display surface on AVF (the ICrosvmAndroidDisplayService path Google's own
+ * Terminal app uses), as opposed to Podroid's current Xvnc/VNC-only display
+ * pipeline. Answers one question — reachable or denied — before any guest
+ * kernel/Mesa/compositor work is worth doing.
  */
 package com.excp.podroid.engine.avf
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.PixelFormat
+import android.media.ImageReader
+import android.os.IBinder
+import android.view.Surface
 import java.io.File
+import java.lang.reflect.InvocationTargetException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /** One-line entries in the diagnostic report; UI just joins them. */
 data class AvfReport(
@@ -286,5 +301,229 @@ object AvfDiagnostics {
 
     private fun deleteSafely(vmm: Any, name: String) {
         runCatching { vmm.javaClass.getMethod("delete", String::class.java).invoke(vmm, name) }
+    }
+
+    // ---- GPU / display probe (experimental spike) --------------------------
+    //
+    // Answers one question: can a non-platform-signed app with the standard
+    // dev-grant (MANAGE_VIRTUAL_MACHINE + USE_CUSTOM_VIRTUAL_MACHINE) reach a
+    // real, GPU-accelerated display surface on AVF — the same path Google's own
+    // Terminal app uses (packages/modules/Virtualization/android/TerminalApp/,
+    // same AOSP tree as the rest of this reflection) — or is it walled off to
+    // privileged/system callers only.
+    //
+    // ServiceManager.waitForService("android.system.virtualizationservice") is
+    // the SAME binder Podroid already reaches via VirtualMachineManager for
+    // every normal VM operation; TerminalApp's DisplayProvider just casts it
+    // through the internal AIDL interface (IVirtualizationServiceInternal)
+    // instead of the public one to reach waitDisplayService(). Whatever
+    // permission check exists inside virtmgr for that method is exactly what
+    // this probe surfaces — SecurityException means "no", a returned service
+    // means "yes", anything else means the API shape differs on this build.
+    //
+    // Unlike AvfReflect.setGpuConfig (backend=2d, surfaceless — used only to
+    // steer crosvm binary selection on every normal launch), this attaches a
+    // real virglrenderer GPU config + a DisplayConfig, because binary
+    // selection isn't what's being tested here.
+
+    private const val CLS_GPU_CFG = "$CLS_CUSTOM_CFG\$GpuConfig"
+    private const val CLS_DISPLAY_CFG = "$CLS_CUSTOM_CFG\$DisplayConfig"
+    private const val SVC_VIRTUALIZATION = "android.system.virtualizationservice"
+    private const val CLS_SERVICE_MANAGER = "android.os.ServiceManager"
+    private const val CLS_INTERNAL = "android.system.virtualizationservice_internal.IVirtualizationServiceInternal"
+    private const val CLS_CROSVM_DISPLAY = "android.crosvm.ICrosvmAndroidDisplayService"
+
+    private sealed class DisplayProbeResult {
+        data class Reached(val service: Any) : DisplayProbeResult()
+        data class TimedOut(val timeoutMs: Long) : DisplayProbeResult()
+        data class Denied(val detail: String) : DisplayProbeResult()
+        data class Unavailable(val detail: String) : DisplayProbeResult()
+    }
+
+    /**
+     * Creates a throwaway custom VM with a real gpu+display config, starts it,
+     * then attempts the exact waitDisplayService() -> setSurface() dance
+     * TerminalApp's DisplayProvider performs. Blocks for a few seconds. Call
+     * off the UI thread. The VM is stopped/deleted before returning.
+     */
+    fun runGpuDisplaySmokeTest(context: Context): String {
+        val pre = probe(context)
+        if (!pre.featureSupported) return "skipped: feature flag not present (device does not ship AVF)"
+        if (!pre.managePermissionGranted) return "skipped: MANAGE_VIRTUAL_MACHINE not granted"
+        if (!pre.customPermissionGranted) return "skipped: USE_CUSTOM_VIRTUAL_MACHINE not granted"
+        if (!pre.managerClassPresent) return "FAILED: $CLS_MANAGER not on the boot classpath"
+
+        val gpuCfgPresent = runCatching { Class.forName("$CLS_GPU_CFG\$Builder") }.isSuccess
+        val displayCfgPresent = runCatching { Class.forName("$CLS_DISPLAY_CFG\$Builder") }.isSuccess
+        if (!gpuCfgPresent || !displayCfgPresent) {
+            return "not available: GpuConfig/DisplayConfig builder classes absent on this AVF revision " +
+                "(gpuConfig=$gpuCfgPresent, displayConfig=$displayCfgPresent)"
+        }
+
+        val kernelSrc = File(context.filesDir, "vmlinuz-virt")
+        val initrd = File(context.filesDir, "initrd.img")
+        if (!kernelSrc.exists()) return "FAILED: kernel not extracted yet at ${kernelSrc.absolutePath}"
+        if (!initrd.exists()) return "FAILED: initrd not extracted yet at ${initrd.absolutePath}"
+
+        if (AvfCapabilities.choose(pre.capabilitiesRaw) is AvfCapabilities.ProtectedVmChoice.Unsupported) {
+            return "not applicable on this device: hypervisor only supports protected VMs; " +
+                "GPU passthrough needs a non-protected custom VM."
+        }
+
+        val name = "podroid-gpu-probe"
+        var reader: ImageReader? = null
+        return try {
+            val vmm = getVirtualizationManager(context)
+                ?: return "FAILED: VirtualMachineManager system service returned null"
+
+            val kernel = ensureRawKernel(kernelSrc)
+            val customCfg = buildGpuCustomImageConfig(kernel.absolutePath, initrd.absolutePath)
+            val config = buildVirtualMachineConfig(vmm, context, customCfg)
+            val vm = invokeOrCreate(vmm, name, config)
+
+            runCatching {
+                vm.javaClass.getMethod("run").invoke(vm)
+            }.onFailure { e ->
+                deleteSafely(vmm, name)
+                return "FAILED at vm.run(): ${e.cause?.javaClass?.simpleName ?: e.javaClass.simpleName}: ${e.cause?.message ?: e.message}"
+            }
+
+            // Give crosvm a moment to stand up virtio-gpu before we go looking
+            // for its display service.
+            Thread.sleep(1000)
+
+            val displayResult = probeDisplayServiceWithTimeout(timeoutMs = 5000)
+            val surfaceResult = (displayResult as? DisplayProbeResult.Reached)?.let {
+                reader = ImageReader.newInstance(320, 480, PixelFormat.RGBA_8888, 2)
+                attemptSetSurface(it.service, reader!!.surface)
+            }
+
+            runCatching { vm.javaClass.getMethod("stop").invoke(vm) }
+            deleteSafely(vmm, name)
+
+            buildString {
+                appendLine("VM created + started with real gpu+display config: OK")
+                append("waitDisplayService(): ")
+                appendLine(
+                    when (displayResult) {
+                        is DisplayProbeResult.Reached -> "SUCCESS — obtained ICrosvmAndroidDisplayService"
+                        is DisplayProbeResult.TimedOut -> "TIMED OUT after ${displayResult.timeoutMs}ms (no display client connected)"
+                        is DisplayProbeResult.Denied -> "DENIED — ${displayResult.detail}"
+                        is DisplayProbeResult.Unavailable -> "UNAVAILABLE — ${displayResult.detail}"
+                    },
+                )
+                if (surfaceResult != null) appendLine("setSurface(): $surfaceResult")
+            }
+        } catch (e: Throwable) {
+            runCatching { getVirtualizationManager(context)?.let { deleteSafely(it, name) } }
+            val cause = e.cause ?: e
+            "FAILED: ${cause.javaClass.simpleName}: ${cause.message}"
+        } finally {
+            runCatching { reader?.close() }
+        }
+    }
+
+    private fun buildGpuCustomImageConfig(kernelPath: String, initrdPath: String): Any {
+        val builderCls = Class.forName("$CLS_CUSTOM_CFG\$Builder")
+        val builder = builderCls.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+        invokeSetter(builderCls, builder, "setName", String::class.java, "podroid-gpu-probe")
+        invokeSetter(builderCls, builder, "setKernelPath", String::class.java, kernelPath)
+        invokeSetter(builderCls, builder, "setInitrdPath", String::class.java, initrdPath)
+        runCatching {
+            invokeSetter(builderCls, builder, "setParams", String::class.java, "console=hvc0 panic=1")
+        }
+
+        val gpuCls = Class.forName(CLS_GPU_CFG)
+        val gpuBuilderCls = Class.forName("$CLS_GPU_CFG\$Builder")
+        val gpuBuilder = gpuBuilderCls.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+        invokeSetter(gpuBuilderCls, gpuBuilder, "setBackend", String::class.java, "virglrenderer")
+        runCatching {
+            invokeSetter(gpuBuilderCls, gpuBuilder, "setContextTypes", Array<String>::class.java, arrayOf("virgl2"))
+        }
+        runCatching { invokeSetter(gpuBuilderCls, gpuBuilder, "setRendererUseEgl", java.lang.Boolean::class.java, true) }
+        runCatching { invokeSetter(gpuBuilderCls, gpuBuilder, "setRendererUseGles", java.lang.Boolean::class.java, true) }
+        runCatching { invokeSetter(gpuBuilderCls, gpuBuilder, "setRendererUseSurfaceless", java.lang.Boolean::class.java, false) }
+        val gpuConfig = gpuBuilderCls.getDeclaredMethod("build").apply { isAccessible = true }.invoke(gpuBuilder)
+        invokeSetter(builderCls, builder, "setGpuConfig", gpuCls, gpuConfig)
+
+        val displayCls = Class.forName(CLS_DISPLAY_CFG)
+        val displayBuilderCls = Class.forName("$CLS_DISPLAY_CFG\$Builder")
+        val displayBuilder = displayBuilderCls.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+        invokeSetter(displayBuilderCls, displayBuilder, "setWidth", Int::class.javaPrimitiveType!!, 320)
+        invokeSetter(displayBuilderCls, displayBuilder, "setHeight", Int::class.javaPrimitiveType!!, 480)
+        runCatching { invokeSetter(displayBuilderCls, displayBuilder, "setHorizontalDpi", Int::class.javaPrimitiveType!!, 160) }
+        runCatching { invokeSetter(displayBuilderCls, displayBuilder, "setVerticalDpi", Int::class.javaPrimitiveType!!, 160) }
+        runCatching { invokeSetter(displayBuilderCls, displayBuilder, "setRefreshRate", Int::class.javaPrimitiveType!!, 60) }
+        val displayConfig = displayBuilderCls.getDeclaredMethod("build").apply { isAccessible = true }.invoke(displayBuilder)
+        invokeSetter(builderCls, builder, "setDisplayConfig", displayCls, displayConfig)
+
+        return builderCls.getDeclaredMethod("build").apply { isAccessible = true }.invoke(builder)
+    }
+
+    /**
+     * Runs the waitForService -> asInterface -> waitDisplayService chain on a
+     * daemon thread with a hard wall-clock timeout: waitForService/
+     * waitDisplayService are blocking-by-design and could hang indefinitely on
+     * a build where the display client never connects.
+     */
+    private fun probeDisplayServiceWithTimeout(timeoutMs: Long): DisplayProbeResult {
+        val resultRef = AtomicReference<DisplayProbeResult>()
+        val latch = CountDownLatch(1)
+        Thread({
+            resultRef.set(probeDisplayServiceBlocking())
+            latch.countDown()
+        }, "AvfGpuProbe").apply { isDaemon = true }.start()
+        val completed = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        if (!completed) return DisplayProbeResult.TimedOut(timeoutMs)
+        return resultRef.get() ?: DisplayProbeResult.Unavailable("probe thread finished without a result")
+    }
+
+    private fun probeDisplayServiceBlocking(): DisplayProbeResult = try {
+        val waitForService = Class.forName(CLS_SERVICE_MANAGER)
+            .getDeclaredMethod("waitForService", String::class.java).apply { isAccessible = true }
+        val binder = waitForService.invoke(null, SVC_VIRTUALIZATION) as? IBinder
+            ?: return DisplayProbeResult.Unavailable("waitForService(\"$SVC_VIRTUALIZATION\") returned null")
+
+        val internalCls = Class.forName(CLS_INTERNAL)
+        val internal = Class.forName("$CLS_INTERNAL\$Stub")
+            .getDeclaredMethod("asInterface", IBinder::class.java).apply { isAccessible = true }
+            .invoke(null, binder)
+            ?: return DisplayProbeResult.Unavailable("IVirtualizationServiceInternal.Stub.asInterface returned null")
+
+        val displayBinder = internalCls.getMethod("waitDisplayService").apply { isAccessible = true }
+            .invoke(internal) as? IBinder
+            ?: return DisplayProbeResult.Unavailable("waitDisplayService() returned null")
+
+        val service = Class.forName("$CLS_CROSVM_DISPLAY\$Stub")
+            .getDeclaredMethod("asInterface", IBinder::class.java).apply { isAccessible = true }
+            .invoke(null, displayBinder)
+            ?: return DisplayProbeResult.Unavailable("ICrosvmAndroidDisplayService.Stub.asInterface returned null")
+
+        DisplayProbeResult.Reached(service)
+    } catch (e: InvocationTargetException) {
+        val cause = e.cause ?: e
+        if (cause is SecurityException) {
+            DisplayProbeResult.Denied("${cause.javaClass.simpleName}: ${cause.message}")
+        } else {
+            DisplayProbeResult.Unavailable("${cause.javaClass.simpleName}: ${cause.message}")
+        }
+    } catch (e: ClassNotFoundException) {
+        DisplayProbeResult.Unavailable("class not found: ${e.message} (API absent on this AVF revision)")
+    } catch (e: NoSuchMethodException) {
+        DisplayProbeResult.Unavailable("method not found: ${e.message} (API shape differs on this AVF revision)")
+    } catch (e: Exception) {
+        DisplayProbeResult.Unavailable("${e.javaClass.simpleName}: ${e.message}")
+    }
+
+    private fun attemptSetSurface(service: Any, surface: Surface): String = try {
+        service.javaClass.getMethod(
+            "setSurface", Surface::class.java, Boolean::class.javaPrimitiveType,
+        ).apply { isAccessible = true }.invoke(service, surface, false)
+        "SUCCESS — crosvm accepted the surface"
+    } catch (e: InvocationTargetException) {
+        val cause = e.cause ?: e
+        "FAILED: ${cause.javaClass.simpleName}: ${cause.message}"
+    } catch (e: Exception) {
+        "FAILED: ${e.javaClass.simpleName}: ${e.message}"
     }
 }

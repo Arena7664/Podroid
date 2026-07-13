@@ -98,6 +98,8 @@
     <string name="avf_diagnostic">AVF (pKVM) diagnostic</string>
     <string name="running_avf_diagnostic">Running AVF diagnostic…</string>
     <string name="probing_avf">Probing…</string>
+    <string name="gpu_display_probe">GPU display probe (experimental)</string>
+    <string name="running_gpu_probe">Running GPU display probe…</string>
     <string name="export_diagnostic_subject">Podroid Diagnostic Log</string>
     <string name="export_diagnostic_chooser">Share diagnostic log</string>
     <string name="export_diagnostic_failed">Export failed: %1$s</string>
